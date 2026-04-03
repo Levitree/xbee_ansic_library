@@ -39,8 +39,7 @@
  *
  * Author:        tom.cocagne@gmail.com (Tom Cocagne)
  *
- * Dependencies:  original: OpenSSL (and Advapi32.lib on Windows)
- *                modified: Mbed TLS (BIGNUM, CTR_DRBG, ENTROPY, SHA256)
+ * Dependencies:  None (stubbed out — SRP not used in this firmware)
  *
  * Usage:         Refer to test_srp.c for a demonstration
  *
