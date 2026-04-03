@@ -4,7 +4,7 @@
 #include "platform_config.h"
 #include "esp_log.h"
 
-const char* TAG = "xbee_serial_idf";
+static const char* TAG = "xbee_serial_idf";
 QueueHandle_t uart_queue;
 
 bool_t xbee_ser_invalid(xbee_serial_t* serial) {
