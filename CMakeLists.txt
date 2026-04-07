@@ -21,3 +21,13 @@ idf_build_set_property(COMPILE_OPTIONS "-DXBEE_CELLULAR_ENABLED" APPEND)
 
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=maybe-uninitialized" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=format-overflow" APPEND)
+
+# Suppress warnings in this third-party library
+target_compile_options(${COMPONENT_LIB} PRIVATE
+    -Wno-implicit-fallthrough
+    -Wno-address-of-packed-member
+    -Wno-unused-variable
+    -Wno-maybe-uninitialized
+    -Wno-format-overflow
+    -Wno-calloc-transposed-args
+)
