@@ -3,9 +3,50 @@
 #include "xbee/serial.h"
 #include "platform_config.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 static const char* TAG = "xbee_serial_idf";
 QueueHandle_t uart_queue;
+
+// The event queue is fed by the IDF UART driver. We surface anything
+// that indicates data loss so sustained-load stalls are visible in logs.
+// RX ring overflow / HW FIFO overrun / framing errors all mean bytes
+// were dropped between the XBee module and the ansic parser, which
+// would otherwise appear to us as "frame just never arrived."
+static void xbee_uart_event_task(void* arg) {
+	uart_port_t port = (uart_port_t)(uintptr_t)arg;
+	uart_event_t event;
+	while (1) {
+		if (xQueueReceive(uart_queue, &event, portMAX_DELAY) != pdTRUE) continue;
+		switch (event.type) {
+		case UART_FIFO_OVF:
+			ESP_LOGE(TAG, "UART%d HW FIFO overrun — bytes lost", port);
+			uart_flush_input(port);
+			xQueueReset(uart_queue);
+			break;
+		case UART_BUFFER_FULL:
+			ESP_LOGE(TAG, "UART%d RX ring full — bytes lost", port);
+			uart_flush_input(port);
+			xQueueReset(uart_queue);
+			break;
+		case UART_FRAME_ERR:
+			ESP_LOGW(TAG, "UART%d frame error", port);
+			break;
+		case UART_PARITY_ERR:
+			ESP_LOGW(TAG, "UART%d parity error", port);
+			break;
+		case UART_BREAK:
+			ESP_LOGW(TAG, "UART%d break detected", port);
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+static bool xbee_uart_monitor_started = false;
 
 bool_t xbee_ser_invalid(xbee_serial_t* serial) {
 	return (serial == NULL || serial->port >= UART_NUM_MAX) ? 1 : 0;
@@ -52,7 +93,16 @@ int xbee_ser_open(xbee_serial_t* serial, uint32_t baudrate) {
 	ESP_ERROR_CHECK(uart_set_pin(serial->port, serial->tx_pin, serial->rx_pin,
 		serial->rts_pin, serial->cts_pin));
 
-	ESP_ERROR_CHECK(uart_driver_install(serial->port, 512, 512, 10, &uart_queue, 0));
+	// RX ring sized for ~350 ms of continuous traffic at 115200 baud. The
+	// previous 512-byte buffer was ~44 ms, so any tick_task delay past that
+	// window silently dropped incoming frames with no log trail.
+	ESP_ERROR_CHECK(uart_driver_install(serial->port, 4096, 1024, 20, &uart_queue, 0));
+
+	if (!xbee_uart_monitor_started) {
+		xbee_uart_monitor_started = true;
+		xTaskCreate(xbee_uart_event_task, "xbee_uart_evt", 2048,
+			(void*)(uintptr_t)serial->port, 10, NULL);
+	}
 
 	ESP_LOGD(TAG, "Serial port %d opened successfully, pins: tx: %d, rx: %d, rts: %d, cts: %d", serial->port,
 		serial->tx_pin, serial->rx_pin, serial->rts_pin, serial->cts_pin);

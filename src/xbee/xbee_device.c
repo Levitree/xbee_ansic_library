@@ -125,9 +125,17 @@ _xbee_device_debug
 int xbee_dev_init( xbee_dev_t *xbee, const xbee_serial_t *serport,
                                  xbee_is_awake_fn is_awake, xbee_reset_fn reset)
 {
+   return xbee_dev_init_ex( xbee, serport, is_awake, reset, 1);
+}
+
+_xbee_device_debug
+int xbee_dev_init_ex( xbee_dev_t *xbee, const xbee_serial_t *serport,
+                                 xbee_is_awake_fn is_awake, xbee_reset_fn reset,
+                                 uint8_t api_mode)
+{
    int error;
 
-   if (! xbee)
+   if (! xbee || (api_mode != 1 && api_mode != 2))
    {
       return -EINVAL;
    }
@@ -143,6 +151,8 @@ int xbee_dev_init( xbee_dev_t *xbee, const xbee_serial_t *serport,
    // set xbee to all zeros, then
    // set up serial port and attempt communications with module
    memset( xbee, 0, sizeof( xbee_dev_t));
+
+   xbee->api_mode = api_mode;
 
    // configuration for serial XBee
    xbee->is_awake = is_awake; // function to read XBee's "ON" pin
@@ -169,6 +179,37 @@ int xbee_dev_init( xbee_dev_t *xbee, const xbee_serial_t *serport,
    #endif
 
    return error;
+}
+
+// AP=2 escaping: 0x7E, 0x7D, 0x11, 0x13 become 0x7D followed by (byte ^ 0x20).
+// The 0x7E start delimiter is NEVER passed through this helper — callers write
+// it raw so it remains the sole resync marker in the stream.
+static int _xbee_ap2_needs_escape( uint8_t b)
+{
+   return b == 0x7E || b == 0x7D || b == 0x11 || b == 0x13;
+}
+
+static int _xbee_ser_write_escaped( xbee_serial_t *serport,
+   const void FAR *buf, uint16_t len)
+{
+   const uint8_t FAR *p = (const uint8_t FAR *)buf;
+   uint16_t i;
+   for (i = 0; i < len; i++)
+   {
+      uint8_t b = p[i];
+      if (_xbee_ap2_needs_escape( b))
+      {
+         uint8_t pair[2];
+         pair[0] = 0x7D;
+         pair[1] = b ^ 0x20;
+         if (xbee_ser_write( serport, pair, 2) != 2) return -EIO;
+      }
+      else
+      {
+         if (xbee_ser_write( serport, &b, 1) != 1) return -EIO;
+      }
+   }
+   return 0;
 }
 
 
@@ -550,18 +591,22 @@ int xbee_frame_write( xbee_dev_t *xbee, const void FAR *header,
 
    // Make sure XBee is asserting CTS and verify that the transmit serial buffer
    // has enough room for the frame (payload + 3-byte header + 1-byte checksum).
+   // In AP=2 every byte except the 0x7E start delimiter may expand to two bytes
+   // on the wire, so budget for the worst case so we never half-write a frame.
    free = xbee_ser_tx_free( &xbee->serport);
    used = xbee_ser_tx_used( &xbee->serport);
    framesize = headerlen + datalen + 3 + 1;
-   if (! cts || free < framesize)
    {
-      #ifdef XBEE_DEVICE_VERBOSE
-         printf( "%s: return -EBUSY (cts = %s, free = %d, framesize = %d)\n",
-            __FUNCTION__, cts ? "yes" : "no", free, framesize);
-      #endif
-      return (framesize - free > used) ? -EMSGSIZE : -EBUSY;
+      int worst_case = (xbee->api_mode == 2) ? (1 + (framesize - 1) * 2) : framesize;
+      if (! cts || free < worst_case)
+      {
+         #ifdef XBEE_DEVICE_VERBOSE
+            printf( "%s: return -EBUSY (cts = %s, free = %d, framesize = %d, worst = %d)\n",
+               __FUNCTION__, cts ? "yes" : "no", free, framesize, worst_case);
+         #endif
+         return (worst_case - free > used) ? -EMSGSIZE : -EBUSY;
+      }
    }
-
    #ifdef XBEE_DEVICE_VERBOSE
       type = *(const char FAR *) (headerlen ? header : data);
       if (headerlen < 2)
@@ -577,27 +622,61 @@ int xbee_frame_write( xbee_dev_t *xbee, const void FAR *header,
          __FUNCTION__, type, id, headerlen + datalen);
    #endif
 
-   // Send 0x7E (start frame marker) and 16-bit length
+   // Always write the 0x7E start delimiter raw. In AP=2 it is also the sole
+   // resync marker, so we never escape it — every other byte that equals 0x7E
+   // in the outbound stream is replaced by the escape pair (0x7D 0x5E).
    prefix.start = 0x7E;
    prefix.length_be = htobe16( headerlen + datalen);
-   xbee_ser_write( &xbee->serport, &prefix, 3);
+   if (xbee->api_mode == 2)
+   {
+      const uint8_t start_byte = 0x7E;
+      if (xbee_ser_write( &xbee->serport, &start_byte, 1) != 1) return -EIO;
+      // Length (2 bytes) is subject to escaping.
+      if (_xbee_ser_write_escaped( &xbee->serport,
+         ((const uint8_t *)&prefix) + 1, 2) < 0) return -EIO;
+   }
+   else
+   {
+      xbee_ser_write( &xbee->serport, &prefix, 3);
+   }
 
    // Send <headerlen> bytes from <header> if it is not NULL
    if (headerlen)
    {
-      xbee_ser_write( &xbee->serport, header, headerlen);
+      if (xbee->api_mode == 2)
+      {
+         if (_xbee_ser_write_escaped( &xbee->serport, header, headerlen) < 0) return -EIO;
+      }
+      else
+      {
+         xbee_ser_write( &xbee->serport, header, headerlen);
+      }
       checksum = _xbee_checksum( header, headerlen, checksum);
    }
 
    // Send <datalen> bytes from <data> if it is not NULL
    if (datalen)
    {
-      xbee_ser_write( &xbee->serport, data, datalen);
+      if (xbee->api_mode == 2)
+      {
+         if (_xbee_ser_write_escaped( &xbee->serport, data, datalen) < 0) return -EIO;
+      }
+      else
+      {
+         xbee_ser_write( &xbee->serport, data, datalen);
+      }
       checksum = _xbee_checksum( data, datalen, checksum);
    }
 
-   // Send 1-byte checksum of bytes in payload
-   xbee_ser_write( &xbee->serport, &checksum, 1);
+   // Send 1-byte checksum of bytes in payload (may need escaping in AP=2)
+   if (xbee->api_mode == 2)
+   {
+      if (_xbee_ser_write_escaped( &xbee->serport, &checksum, 1) < 0) return -EIO;
+   }
+   else
+   {
+      xbee_ser_write( &xbee->serport, &checksum, 1);
+   }
 
    return 0;
 }
@@ -625,6 +704,53 @@ int xbee_frame_write( xbee_dev_t *xbee, const void FAR *header,
 
    @see xbee_dev_init(), _xbee_frame_dispatch()
 */
+// Read one logical byte from the serial port, applying AP=2 unescape rules.
+//   return  1  *out holds a valid byte (escape already applied)
+//   return  2  a literal 0x7E was seen; *out = 0x7E and caller must resync
+//              (escape_next is cleared; 0x7E is never part of an escape pair)
+//   return  0  not enough data in the serial buffer yet
+//   return <0  serial read error
+// In AP=1 this function behaves like a single xbee_ser_read of one byte, with
+// a 0x7E also signaled via return 2 so the caller's existing resync paths fire.
+static int _xbee_read_unescaped( xbee_dev_t *xbee, uint8_t *out)
+{
+   uint8_t ch;
+   int n;
+   for (;;)
+   {
+      n = xbee_ser_read( &xbee->serport, &ch, 1);
+      if (n != 1) return n < 0 ? n : 0;
+
+      if (ch == 0x7E)
+      {
+         // Frame start delimiter. 0x7E is never escaped, so seeing it here
+         // always means "abandon in-progress state and treat this as fresh
+         // frame boundary."
+         xbee->rx.escape_next = 0;
+         *out = ch;
+         return 2;
+      }
+
+      if (xbee->api_mode == 2)
+      {
+         if (xbee->rx.escape_next)
+         {
+            xbee->rx.escape_next = 0;
+            *out = (uint8_t)(ch ^ 0x20);
+            return 1;
+         }
+         if (ch == 0x7D)
+         {
+            xbee->rx.escape_next = 1;
+            continue;   // read the next byte and unescape it
+         }
+      }
+
+      *out = ch;
+      return 1;
+   }
+}
+
 _xbee_device_debug
 int _xbee_frame_load( xbee_dev_t *xbee)
 {
@@ -669,7 +795,9 @@ int _xbee_frame_load( xbee_dev_t *xbee)
                It may seem inefficient to read one byte at a time while looking
                for the 0x7E start byte, but in reality we almost always read it
                in on the first attempt (i.e., the buffer should be empty or will
-               start with 0x7E).
+               start with 0x7E).  In AP=2 we also clear any stale escape state
+               on resync so a 0x7D that appeared before the 0x7E can't corrupt
+               the first byte of the new frame.
             */
             do {
                ser_read = xbee_ser_read( serport, &ch, 1);
@@ -680,19 +808,19 @@ int _xbee_frame_load( xbee_dev_t *xbee)
             #ifdef XBEE_DEVICE_VERBOSE
                printf( "%s: got start-of-frame\n", __FUNCTION__);
             #endif
+            xbee->rx.escape_next = 0;
             xbee->rx.state = XBEE_RX_STATE_LENGTH_MSB;
             // fall through to next state
 
          case XBEE_RX_STATE_LENGTH_MSB:
-            // try to read a character from the serial port
-            ser_read = xbee_ser_read( serport, &ch, 1);
-            if (ser_read != 1) {
+         {
+            int r = _xbee_read_unescaped( xbee, &ch);
+            if (r <= 0) {
+               ser_read = r;
                goto _exit_loop;
             }
-            if (ch == 0x7E)
+            if (r == 2)   // literal 0x7E — treat as new start-of-frame
             {
-               // MSB of length can never be 0x7E, consider it to be the new
-               // start-of-frame character and recheck for the length.
                #ifdef XBEE_DEVICE_VERBOSE
                   printf( "%s: ignoring duplicate start-of-frame (0x7E)\n",
                      __FUNCTION__);
@@ -703,11 +831,18 @@ int _xbee_frame_load( xbee_dev_t *xbee)
             xbee->rx.bytes_in_frame = ch << 8;
             xbee->rx.state = XBEE_RX_STATE_LENGTH_LSB;
             // fall through to trying to read LSB of length
+         }
          case XBEE_RX_STATE_LENGTH_LSB:
-            // try to read a character from the serial port
-            ser_read = xbee_ser_read( serport, &ch, 1);
-            if (ser_read != 1) {
+         {
+            int r = _xbee_read_unescaped( xbee, &ch);
+            if (r <= 0) {
+               ser_read = r;
                goto _exit_loop;
+            }
+            if (r == 2)   // 0x7E mid-length means abandon & restart
+            {
+               xbee->rx.state = XBEE_RX_STATE_LENGTH_MSB;
+               break;
             }
 
             // set LSB of frame length, make local copy for range check
@@ -719,16 +854,7 @@ int _xbee_frame_load( xbee_dev_t *xbee)
                   printf( "%s: read bad frame length (%u ! [2 .. %u])\n",
                      __FUNCTION__, length, XBEE_MAX_RX_FRAME_LEN);
                #endif
-               if (ch == 0x7E)
-               {
-                  // Handle case of 0x7E 0xXX 0x7E where second 0x7E is actual
-                  // start of frame.
-                  xbee->rx.state = XBEE_RX_STATE_LENGTH_MSB;
-               }
-               else
-               {
-                  xbee->rx.state = XBEE_RX_STATE_WAITSTART;
-               }
+               xbee->rx.state = XBEE_RX_STATE_WAITSTART;
                break;
             }
             #ifdef XBEE_DEVICE_VERBOSE
@@ -737,20 +863,49 @@ int _xbee_frame_load( xbee_dev_t *xbee)
             xbee->rx.state = XBEE_RX_STATE_RXFRAME;
             xbee->rx.bytes_read = 0;
             // fall through to next state
+         }
 
          case XBEE_RX_STATE_RXFRAME:      // receiving frame & trailing checksum
-            bytes_left = xbee->rx.bytes_in_frame - xbee->rx.bytes_read + 1;
-            ser_read = xbee_ser_read( serport,
-                     xbee->rx.frame_data + xbee->rx.bytes_read, bytes_left);
-            if (ser_read != bytes_left)
+            if (xbee->api_mode == 2)
             {
-               // Not enough bytes to finish reading current frame, record
-               // number of bytes read and return.
-               if (ser_read > 0)
+               // Byte-at-a-time read with unescape. A literal 0x7E aborts and
+               // restarts the frame — a genuine resync, not a payload byte.
+               int resync = 0;
+               while (xbee->rx.bytes_read <= xbee->rx.bytes_in_frame)
                {
-                  xbee->rx.bytes_read += ser_read;
+                  int r = _xbee_read_unescaped( xbee, &ch);
+                  if (r <= 0) {
+                     ser_read = r;
+                     goto _exit_loop;
+                  }
+                  if (r == 2)
+                  {
+                     #ifdef XBEE_DEVICE_VERBOSE
+                        printf( "%s: 0x7E in RXFRAME — resyncing\n", __FUNCTION__);
+                     #endif
+                     xbee->rx.state = XBEE_RX_STATE_LENGTH_MSB;
+                     resync = 1;
+                     break;
+                  }
+                  xbee->rx.frame_data[xbee->rx.bytes_read++] = ch;
                }
-               goto _exit_loop;
+               if (resync) break;
+            }
+            else
+            {
+               bytes_left = xbee->rx.bytes_in_frame - xbee->rx.bytes_read + 1;
+               ser_read = xbee_ser_read( serport,
+                        xbee->rx.frame_data + xbee->rx.bytes_read, bytes_left);
+               if (ser_read != bytes_left)
+               {
+                  // Not enough bytes to finish reading current frame, record
+                  // number of bytes read and return.
+                  if (ser_read > 0)
+                  {
+                     xbee->rx.bytes_read += ser_read;
+                  }
+                  goto _exit_loop;
+               }
             }
 
             // ready to load more frames on next pass

@@ -460,6 +460,11 @@ typedef struct xbee_dev_t
 
    uint8_t     frame_id;            ///< last frame_id used for sending
 
+   /// API operating mode on the wire: 1 = no escaping, 2 = escaped characters.
+   /// Defaults to 1 when initialized via xbee_dev_init(); use xbee_dev_init_ex()
+   /// to select mode 2. Must match the module's AP register (ATAP).
+   uint8_t     api_mode;
+
    // Need some state variables here if AT mode is supported (necessary when
    // using modules with AT firmware instead of API firmware, or when doing
    // firmware updates on DigiMesh 900 with API firmware).  Current state:
@@ -489,6 +494,10 @@ typedef struct xbee_dev_t
 
       /// bytes read so far
       uint16_t                bytes_read;
+
+      /// AP=2 only: next non-0x7E byte needs XOR 0x20 before use.
+      /// Cleared whenever a literal 0x7E is seen (which always resyncs).
+      uint8_t                 escape_next;
 
       /// bytes received, starting with frame_type, +1 is for checksum
       uint8_t  frame_data[XBEE_MAX_FRAME_LEN + 1];
@@ -527,6 +536,12 @@ uint8_t xbee_next_frame_id( xbee_dev_t *xbee);
 
 int xbee_dev_init( xbee_dev_t *xbee, const xbee_serial_t *serport,
    xbee_is_awake_fn is_awake, xbee_reset_fn reset);
+
+/// Like xbee_dev_init() but selects the on-wire API mode. Pass 1 for the
+/// classic non-escaped protocol or 2 for the escaped protocol. Must match
+/// the XBee module's ATAP setting.
+int xbee_dev_init_ex( xbee_dev_t *xbee, const xbee_serial_t *serport,
+   xbee_is_awake_fn is_awake, xbee_reset_fn reset, uint8_t api_mode);
 
 void xbee_dev_dump_settings( xbee_dev_t *xbee, uint16_t flags);
    #define XBEE_DEV_DUMP_FLAG_NONE        0x0000
