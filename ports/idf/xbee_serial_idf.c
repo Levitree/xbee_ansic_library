@@ -118,8 +118,11 @@ int xbee_ser_open(xbee_serial_t* serial, uint32_t baudrate) {
 
 	if (!xbee_uart_monitor_started) {
 		xbee_uart_monitor_started = true;
-		xTaskCreate(xbee_uart_event_task, "xbee_uart_evt", 2048,
-			(void*)(uintptr_t)serial->port, 10, NULL);
+		// Pin to core 0 alongside xbee_tick / xbee_tx (see main/xbee/xbee.cpp)
+		// so the UART_DATA → notify → tick wakeup path stays on one scheduler
+		// without a cross-core IPI.
+		xTaskCreatePinnedToCore(xbee_uart_event_task, "xbee_uart_evt", 2048,
+			(void*)(uintptr_t)serial->port, 10, NULL, 0);
 	}
 
 	ESP_LOGD(TAG, "Serial port %d opened successfully, pins: tx: %d, rx: %d, rts: %d, cts: %d", serial->port,
