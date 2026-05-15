@@ -10,6 +10,15 @@
 static const char* TAG = "xbee_serial_idf";
 QueueHandle_t uart_queue;
 
+// Task to wake on UART_DATA events. Lets a consumer (e.g. xbee_tick_task)
+// run xbee_dev_tick() on demand instead of polling on a fixed delay, which
+// removes up to one polling-interval of latency per inbound frame.
+static TaskHandle_t s_data_notify_task = NULL;
+
+void xbee_ser_set_data_notify(TaskHandle_t task) {
+	s_data_notify_task = task;
+}
+
 // The event queue is fed by the IDF UART driver. We surface anything
 // that indicates data loss so sustained-load stalls are visible in logs.
 // RX ring overflow / HW FIFO overrun / framing errors all mean bytes
@@ -21,6 +30,11 @@ static void xbee_uart_event_task(void* arg) {
 	while (1) {
 		if (xQueueReceive(uart_queue, &event, portMAX_DELAY) != pdTRUE) continue;
 		switch (event.type) {
+		case UART_DATA:
+			if (s_data_notify_task != NULL) {
+				xTaskNotifyGive(s_data_notify_task);
+			}
+			break;
 		case UART_FIFO_OVF:
 			ESP_LOGE(TAG, "UART%d HW FIFO overrun — bytes lost", port);
 			uart_flush_input(port);
@@ -92,6 +106,10 @@ int xbee_ser_open(xbee_serial_t* serial, uint32_t baudrate) {
 
 	ESP_ERROR_CHECK(uart_set_pin(serial->port, serial->tx_pin, serial->rx_pin,
 		serial->rts_pin, serial->cts_pin));
+
+	if (serial->hw_flow_control) {
+		ESP_ERROR_CHECK(uart_set_hw_flow_ctrl(serial->port, UART_HW_FLOWCTRL_CTS_RTS, 122));
+	}
 
 	// RX ring sized for ~350 ms of continuous traffic at 115200 baud. The
 	// previous 512-byte buffer was ~44 ms, so any tick_task delay past that
@@ -225,7 +243,8 @@ int xbee_ser_getchar(xbee_serial_t* serial) {
 
 	if (result < 0) {
 		return -EIO;
-	} else if (result == 0) {
+	}
+	else if (result == 0) {
 		return -ENODATA; // No data available
 	}
 
